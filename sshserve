@@ -1,0 +1,619 @@
+#!/usr/bin/env bash
+# sshserve.sh — ephemeral SSH server for CURRENT DIR
+set -euo pipefail
+IFS=$'\n\t'
+
+# Color codes - define at the very beginning
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+GRAY='\033[0;90m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+usage() {
+  echo -e "${CYAN}${BOLD}╔════════════════════════════════════════════════════════════════╗${RESET}"
+  echo -e "${CYAN}${BOLD}║${RESET}                      ${WHITE}${BOLD}SSH/SFTP SERVER TOOL${RESET}                      ${CYAN}${BOLD}║${RESET}"
+  echo -e "${CYAN}${BOLD}╚════════════════════════════════════════════════════════════════╝${RESET}"
+  echo ""
+  echo -e "${WHITE}${BOLD}USAGE:${RESET}"
+  echo -e "  $0 [OPTIONS]"
+  echo ""
+  echo -e "${WHITE}${BOLD}DESCRIPTION:${RESET}"
+  echo -e "  Creates an ephemeral SSH/SFTP server to share your current directory."
+  echo -e "  Runs in a chroot with temporary credentials for maximum security."
+  echo ""
+  echo -e "${WHITE}${BOLD}OPTIONS:${RESET}"
+  echo -e "  ${GREEN}-P${RESET} <port>        Port to listen on ${GRAY}(default: 2222)${RESET}"
+  echo -e "  ${GREEN}-u${RESET} <username>    Username for authentication ${GRAY}(default: random)${RESET}"
+  echo -e "  ${GREEN}-p${RESET} <password>    Password for authentication ${GRAY}(default: random)${RESET}"
+  echo -e "  ${GREEN}-i${RESET} <ip>          IP address to bind to ${GRAY}(default: 0.0.0.0)${RESET}"
+  echo -e "  ${GREEN}--use-key${RESET}        Use SSH key authentication instead of password"
+  echo -e "  ${GREEN}--allow-ssh${RESET}      Enable SSH shell access ${GRAY}(default: SFTP only)${RESET}"
+  echo -e "  ${GREEN}-h${RESET}               Show this help message"
+  echo ""
+  echo -e "${WHITE}${BOLD}SECURITY MODES:${RESET}"
+  echo -e "  ${GREEN}SFTP Only${RESET} (default)"
+  echo -e "    ${GRAY}→${RESET} File transfers only, no command execution"
+  echo -e "    ${GRAY}→${RESET} Most secure option"
+  echo -e "    ${GRAY}→${RESET} Recommended for untrusted networks"
+  echo ""
+  echo -e "  ${YELLOW}SSH Enabled${RESET} (--allow-ssh)"
+  echo -e "    ${GRAY}→${RESET} Allows SCP, SFTP, and shell access"
+  echo -e "    ${GRAY}→${RESET} Commands execute within chroot jail"
+  echo -e "    ${GRAY}→${RESET} Use only when shell access is needed"
+  echo ""
+  echo -e "${WHITE}${BOLD}AUTHENTICATION:${RESET}"
+  echo -e "  ${GREEN}Password${RESET} (default)"
+  echo -e "    ${GRAY}→${RESET} Username/password authentication"
+  echo -e "    ${GRAY}→${RESET} Credentials displayed on startup"
+  echo ""
+  echo -e "  ${GREEN}SSH Key${RESET} (--use-key)"
+  echo -e "    ${GRAY}→${RESET} Generates temporary SSH key pair"
+  echo -e "    ${GRAY}→${RESET} More secure, no password needed"
+  echo -e "    ${GRAY}→${RESET} Private key saved to /var/lib/sshserve/keys/"
+  echo ""
+  echo -e "${WHITE}${BOLD}EXAMPLES:${RESET}"
+  echo -e "  ${GRAY}# Start SFTP server on default port${RESET}"
+  echo -e "  sudo $0"
+  echo ""
+  echo -e "  ${GRAY}# Custom credentials and port${RESET}"
+  echo -e "  sudo $0 -u admin -p secret123 -P 2222"
+  echo ""
+  echo -e "  ${GRAY}# Enable SSH with key-based auth${RESET}"
+  echo -e "  sudo $0 --allow-ssh --use-key -P 2200"
+  echo ""
+  echo -e "${WHITE}${BOLD}PERSISTENCE:${RESET}"
+  echo -e "  ${GRAY}→${RESET} Host keys: ${CYAN}/var/lib/sshserve/hostkeys/${RESET}"
+  echo -e "  ${GRAY}→${RESET} Shell history: ${CYAN}/var/lib/sshserve/history/${RESET}"
+  echo -e "  ${GRAY}→${RESET} Session keys: ${CYAN}/var/lib/sshserve/keys/${RESET}"
+  echo -e "  ${GRAY}→${RESET} All other changes are temporary and cleaned up on exit"
+  echo ""
+  echo -e "${WHITE}${BOLD}NOTES:${RESET}"
+  echo -e "  ${GRAY}•${RESET} Requires root/sudo privileges"
+  echo -e "  ${GRAY}•${RESET} Temporary user is created and removed on exit"
+  echo -e "  ${GRAY}•${RESET} Files uploaded will be owned by your real user account"
+  echo -e "  ${GRAY}•${RESET} Press Ctrl+C to stop the server"
+  echo ""
+  exit 0
+}
+
+PORT="2222"
+USERNAME=""
+PASS=""
+LISTEN_IP="0.0.0.0"
+ALLOW_SSH=false
+USE_KEY=false
+
+# Store original arguments before parsing
+ORIG_ARGS=("$@")
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -P)
+      PORT="$2"
+      shift 2
+      ;;
+    -u)
+      USERNAME="$2"
+      shift 2
+      ;;
+    -p)
+      PASS="$2"
+      shift 2
+      ;;
+    -i)
+      LISTEN_IP="$2"
+      shift 2
+      ;;
+    --allow-ssh)
+      ALLOW_SSH=true
+      shift
+      ;;
+    --use-key)
+      USE_KEY=true
+      shift
+      ;;
+    -h)
+      usage
+      ;;
+    *)
+      echo "Unknown option: $1"
+      usage
+      ;;
+  esac
+done
+
+# Elevate with sudo; if not possible, tell the user explicitly
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  # Store the original user's UID and GID before sudo
+  ORIGINAL_UID=$(id -u)
+  ORIGINAL_GID=$(id -g)
+  ORIGINAL_USER=$(id -un)
+  
+  if sudo -n true 2>/dev/null; then
+    exec sudo -E ORIGINAL_UID="$ORIGINAL_UID" ORIGINAL_GID="$ORIGINAL_GID" ORIGINAL_USER="$ORIGINAL_USER" "$0" "${ORIG_ARGS[@]}"
+  else
+    echo "Please run with sudo: sudo $0 ${ORIG_ARGS[*]}" >&2
+    exit 1
+  fi
+fi
+
+# If we got here via sudo, these should be set; otherwise we're already root
+if [ -z "${ORIGINAL_UID:-}" ]; then
+  echo "Error: Could not determine original user. Run with sudo, not as root directly." >&2
+  exit 1
+fi
+
+SRCDIR="$(pwd)"
+# Use /var/lib instead of /tmp for chroot (OpenSSH requires proper permissions on all parent dirs)
+CHROOT_BASE="/var/lib/sshserve"
+mkdir -p "$CHROOT_BASE"
+chmod 755 "$CHROOT_BASE"
+chown root:root "$CHROOT_BASE"
+WORKDIR="$(mktemp -d "$CHROOT_BASE/session.XXXX")"
+CHROOTDIR="$WORKDIR/chroot"
+HOSTKEYS_DIR="$CHROOT_BASE/hostkeys"
+SESSKEYS_DIR="$CHROOT_BASE/keys"
+
+# Generate username if not provided - ensure it's unique and temporary
+if [ -z "$USERNAME" ]; then
+  USER="sshserve_$(date +%s)_$RANDOM"
+else
+  # Validate that this username doesn't already exist
+  if id "$USERNAME" >/dev/null 2>&1; then
+    echo "Error: Username '$USERNAME' already exists. Choose a different username." >&2
+    echo "       This script only creates temporary users to avoid modifying existing accounts." >&2
+    exit 1
+  fi
+  USER="$USERNAME"
+fi
+
+# Generate password if not provided (and not using key auth)
+if [ "$USE_KEY" = false ]; then
+  if [ -z "$PASS" ]; then
+    PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c12 || true)"
+    # Fallback if urandom fails
+    if [ -z "$PASS" ]; then
+      PASS="Temp$(date +%s)$RANDOM"
+    fi
+  fi
+else
+  # Using key auth - generate SSH key pair
+  mkdir -p "$SESSKEYS_DIR"
+  chmod 700 "$SESSKEYS_DIR"
+  
+  SESSION_KEY="$SESSKEYS_DIR/${USER}_$(date +%s)"
+  ssh-keygen -t ed25519 -f "$SESSION_KEY" -N "" -C "$USER@sshserve" >/dev/null 2>&1
+  chmod 600 "$SESSION_KEY"
+  chmod 644 "$SESSION_KEY.pub"
+  
+  echo -e "${GREEN}✓${RESET} Generated SSH key pair for session"
+fi
+
+SSHD="$(command -v sshd || echo /usr/sbin/sshd)"
+
+# Locate sftp-server
+SFTP_PATH=""
+for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/ssh/sftp-server /usr/lib64/openssh/sftp-server; do
+  [ -x "$p" ] && { SFTP_PATH="$p"; break; }
+done
+[ -n "$SFTP_PATH" ] || { echo "sftp-server not found"; exit 1; }
+
+# Track whether we created the user
+CREATED_USER=false
+
+cleanup() {
+  # Prevent multiple cleanup calls
+  if [ "${CLEANUP_DONE:-}" = "true" ]; then
+    return
+  fi
+  CLEANUP_DONE=true
+  
+  echo ""
+  echo -e "${CYAN}${BOLD}╔════════════════════════════════════════════════════════════════╗${RESET}"
+  echo -e "${CYAN}${BOLD}║${RESET}                       ${WHITE}${BOLD}SHUTTING DOWN${RESET}                              ${CYAN}${BOLD}║${RESET}"
+  echo -e "${CYAN}${BOLD}╚════════════════════════════════════════════════════════════════╝${RESET}"
+  echo ""
+  
+  # Stop monitoring process
+  if [ -n "${MONITOR_PID-}" ]; then
+    kill "$MONITOR_PID" 2>/dev/null || true
+    echo -e "${GREEN}✓${RESET} Stopped log monitor"
+  fi
+  
+  # Stop SSH daemon
+  if [ -n "${SSHD_PID-}" ]; then
+    kill "$SSHD_PID" 2>/dev/null || true
+    echo -e "${GREEN}✓${RESET} Stopped SSH daemon"
+  fi
+  sleep 0.5
+  
+  # Unmount devpts if it was mounted
+  if [ "$ALLOW_SSH" = true ]; then
+    umount "$CHROOTDIR/dev/pts" 2>/dev/null || true
+    umount "$CHROOTDIR/var/lib/sshserve/history" 2>/dev/null || true
+    echo -e "${GREEN}✓${RESET} Unmounted chroot filesystems"
+  fi
+  
+  # Unmount bind mount
+  umount -l "$CHROOTDIR/shared" 2>/dev/null || true
+  echo -e "${GREEN}✓${RESET} Unmounted shared directory"
+  
+  # Remove temporary user ONLY if we created it
+  if [ "$CREATED_USER" = true ]; then
+    userdel -f "$USER" 2>/dev/null || true
+    echo -e "${GREEN}✓${RESET} Removed temporary user '$USER'"
+  fi
+  
+  # Clean up session directory (includes chroot with all binaries/libs)
+  rm -rf "$WORKDIR"
+  echo -e "${GREEN}✓${RESET} Cleaned up temporary files"
+  
+  # Clean up old sessions (older than 1 day)
+  find "$CHROOT_BASE" -maxdepth 1 -name "session.*" -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+  
+  echo ""
+  echo -e "${WHITE}${BOLD}📦 PERSISTENT DATA${RESET}"
+  echo -e "  ${CYAN}Host keys:${RESET}     ${GRAY}$CHROOT_BASE/hostkeys/${RESET}"
+  echo -e "  ${CYAN}Shell history:${RESET} ${GRAY}$CHROOT_BASE/history/.bash_history${RESET}"
+  echo ""
+  echo -e "${GREEN}${BOLD}✓ Cleanup complete. No other persistent system changes.${RESET}"
+  echo -e "${CYAN}${BOLD}╚════════════════════════════════════════════════════════════════╝${RESET}"
+  echo ""
+}
+
+trap cleanup EXIT INT TERM
+
+# Create user with original user's UID/GID using -o to allow non-unique
+# This ensures files are owned by the real user
+echo -e "${CYAN}[*]${RESET} Creating temporary user '${BOLD}$USER${RESET}'..."
+if [ "$ALLOW_SSH" = true ]; then
+  useradd -M -o -u "$ORIGINAL_UID" -g "$ORIGINAL_GID" -d /shared -s /bin/bash "$USER" 2>/dev/null || {
+    echo -e "${RED}✗ Error: Failed to create user '$USER'. The username may already exist.${RESET}" >&2
+    exit 1
+  }
+else
+  useradd -M -o -u "$ORIGINAL_UID" -g "$ORIGINAL_GID" -d /shared -s /usr/sbin/nologin "$USER" 2>/dev/null || {
+    echo -e "${RED}✗ Error: Failed to create user '$USER'. The username may already exist.${RESET}" >&2
+    exit 1
+  }
+fi
+CREATED_USER=true
+echo -e "${GREEN}✓${RESET} User created successfully"
+
+# Set password - create shadow entry manually to avoid PAM issues
+# This is safer than chpasswd which may invoke PAM
+if [ "$USE_KEY" = false ]; then
+  echo -e "${CYAN}[*]${RESET} Setting password..."
+  PASS_HASH=$(openssl passwd -6 "$PASS" 2>/dev/null || perl -e 'print crypt($ARGV[0], "\$6\$" . join("", map{("a".."z","A".."Z",0..9)[rand 62]}(1..16)) . "\$")' "$PASS")
+  usermod -p "$PASS_HASH" "$USER"
+  echo -e "${GREEN}✓${RESET} Password configured"
+else
+  echo -e "${CYAN}[*]${RESET} Configuring SSH key authentication..."
+  # Lock password for key-only auth
+  usermod -p '!' "$USER"
+  echo -e "${GREEN}✓${RESET} SSH key authentication configured"
+fi
+
+# Get the actual UID and GID assigned to the user
+USER_UID=$(id -u "$USER")
+USER_GID=$(id -g "$USER")
+
+# Create chroot environment with correct permissions
+# Chroot directory MUST be owned by root:root with 755 for OpenSSH
+mkdir -p "$CHROOTDIR/shared"
+chmod 755 "$CHROOTDIR"
+chown root:root "$CHROOTDIR"
+
+# If SSH is allowed, create minimal chroot environment
+if [ "$ALLOW_SSH" = true ]; then
+  echo -e "${CYAN}[*]${RESET} Building chroot environment..."
+  # Create necessary directories
+  mkdir -p "$CHROOTDIR"/{bin,lib,lib64,usr/bin,usr/lib,usr/lib64,etc,dev/pts}
+  
+  # Copy essential binaries
+  for cmd in bash ls cat cp mv rm mkdir pwd id whoami echo touch chmod chown grep sed awk find tar gzip gunzip head tail less more nano vi vim; do
+    cmd_path=$(command -v "$cmd" 2>/dev/null || echo "")
+    if [ -n "$cmd_path" ]; then
+      cp -f "$cmd_path" "$CHROOTDIR/bin/" 2>/dev/null || true
+    fi
+  done
+  
+  # Copy library dependencies for all binaries
+  for bin in "$CHROOTDIR/bin/"*; do
+    if [ -f "$bin" ] && [ -x "$bin" ]; then
+      # Get library dependencies - disable pipefail temporarily for this
+      set +e
+      ldd "$bin" 2>/dev/null | grep -o '/[^ ]*' | while read -r lib; do
+        if [ -f "$lib" ]; then
+          libdir=$(dirname "$lib")
+          mkdir -p "$CHROOTDIR$libdir" 2>/dev/null
+          cp -f "$lib" "$CHROOTDIR$lib" 2>/dev/null
+        fi
+      done
+      set -e
+    fi
+  done
+  
+  # Create minimal /etc files with actual UID/GID
+  echo "root:x:0:0:root:/root:/bin/bash" > "$CHROOTDIR/etc/passwd"
+  echo "$USER:x:$USER_UID:$USER_GID:$ORIGINAL_USER:/shared:/bin/bash" >> "$CHROOTDIR/etc/passwd"
+  echo "root:x:0:" > "$CHROOTDIR/etc/group"
+  echo "$USER:x:$USER_GID:" >> "$CHROOTDIR/etc/group"
+  
+  # Create bash profile to redirect history to our managed location
+  mkdir -p "$CHROOTDIR/etc/skel"
+  cat > "$CHROOTDIR/etc/bash.bashrc" <<'BASHRC'
+# Redirect bash history to /var/lib/sshserve
+export HISTFILE=/var/lib/sshserve/history/.bash_history
+export HISTSIZE=1000
+export HISTFILESIZE=2000
+BASHRC
+  
+  # Create history directory in the real /var/lib/sshserve (outside chroot)
+  mkdir -p "$CHROOT_BASE/history"
+  chmod 777 "$CHROOT_BASE/history"  # Allow user to write history
+  touch "$CHROOT_BASE/history/.bash_history"
+  chmod 666 "$CHROOT_BASE/history/.bash_history"  # Make writable by any user
+  
+  # Create var/lib structure inside chroot and bind mount the history directory
+  mkdir -p "$CHROOTDIR/var/lib/sshserve/history"
+  mount --bind "$CHROOT_BASE/history" "$CHROOTDIR/var/lib/sshserve/history" 2>/dev/null || {
+    echo -e "${YELLOW}⚠${RESET} Warning: Could not mount history directory. History will not persist." >&2
+  }
+  
+  # Create device nodes
+  [ -e "$CHROOTDIR/dev/null" ] || mknod -m 666 "$CHROOTDIR/dev/null" c 1 3
+  [ -e "$CHROOTDIR/dev/zero" ] || mknod -m 666 "$CHROOTDIR/dev/zero" c 1 5
+  [ -e "$CHROOTDIR/dev/random" ] || mknod -m 444 "$CHROOTDIR/dev/random" c 1 8
+  [ -e "$CHROOTDIR/dev/urandom" ] || mknod -m 444 "$CHROOTDIR/dev/urandom" c 1 9
+  
+  # Mount devpts for PTY support
+  mount -t devpts -o newinstance,ptmxmode=0666 devpts "$CHROOTDIR/dev/pts"
+  
+  # Create ptmx symlink
+  ln -sf pts/ptmx "$CHROOTDIR/dev/ptmx" 2>/dev/null || true
+  
+  echo -e "${GREEN}✓${RESET} Chroot environment ready"
+fi
+
+# Mount the source directory into the shared subdirectory
+echo -e "${CYAN}[*]${RESET} Mounting shared directory..."
+mount --bind "$SRCDIR" "$CHROOTDIR/shared"
+echo -e "${GREEN}✓${RESET} Directory mounted"
+
+# Set up SSH authorized_keys if using key auth
+if [ "$USE_KEY" = true ]; then
+  mkdir -p "$CHROOTDIR/shared/.ssh"
+  cat "$SESSION_KEY.pub" > "$CHROOTDIR/shared/.ssh/authorized_keys"
+  chmod 700 "$CHROOTDIR/shared/.ssh"
+  chmod 600 "$CHROOTDIR/shared/.ssh/authorized_keys"
+  chown -R "$USER_UID:$USER_GID" "$CHROOTDIR/shared/.ssh"
+  echo -e "${GREEN}✓${RESET} Authorized key installed"
+fi
+
+# The shared directory is already owned by the original user via bind mount
+# No need to chown as it would affect the original directory
+
+# Ensure persistent host keys directory exists
+echo -e "${CYAN}[*]${RESET} Configuring host keys..."
+mkdir -p "$HOSTKEYS_DIR"
+chmod 700 "$HOSTKEYS_DIR"
+
+# Generate or reuse host keys
+if [ ! -f "$HOSTKEYS_DIR/ssh_host_ed25519_key" ]; then
+  ssh-keygen -q -t ed25519 -f "$HOSTKEYS_DIR/ssh_host_ed25519_key" -N "" >/dev/null
+  echo -e "${GREEN}✓${RESET} Generated ED25519 host key"
+else
+  echo -e "${GREEN}✓${RESET} Using existing ED25519 host key"
+fi
+if [ ! -f "$HOSTKEYS_DIR/ssh_host_rsa_key" ]; then
+  ssh-keygen -q -t rsa -b 2048 -f "$HOSTKEYS_DIR/ssh_host_rsa_key" -N "" >/dev/null
+  echo -e "${GREEN}✓${RESET} Generated RSA host key"
+else
+  echo -e "${GREEN}✓${RESET} Using existing RSA host key"
+fi
+
+if [ "$ALLOW_SSH" = true ]; then
+  cat > "$WORKDIR/sshd_config" <<EOF
+Port $PORT
+ListenAddress $LISTEN_IP
+HostKey $HOSTKEYS_DIR/ssh_host_rsa_key
+HostKey $HOSTKEYS_DIR/ssh_host_ed25519_key
+PasswordAuthentication $([ "$USE_KEY" = false ] && echo "yes" || echo "no")
+PubkeyAuthentication $([ "$USE_KEY" = true ] && echo "yes" || echo "no")
+AuthorizedKeysFile /shared/.ssh/authorized_keys
+PermitRootLogin no
+ChallengeResponseAuthentication no
+UsePAM no
+UseDNS no
+PidFile $WORKDIR/sshd.pid
+LogLevel VERBOSE
+AllowUsers $USER
+Subsystem sftp internal-sftp
+
+Match User $USER
+    ChrootDirectory $CHROOTDIR
+    X11Forwarding no
+    AllowTcpForwarding no
+EOF
+else
+  cat > "$WORKDIR/sshd_config" <<EOF
+Port $PORT
+ListenAddress $LISTEN_IP
+HostKey $HOSTKEYS_DIR/ssh_host_rsa_key
+HostKey $HOSTKEYS_DIR/ssh_host_ed25519_key
+PasswordAuthentication $([ "$USE_KEY" = false ] && echo "yes" || echo "no")
+PubkeyAuthentication $([ "$USE_KEY" = true ] && echo "yes" || echo "no")
+AuthorizedKeysFile /shared/.ssh/authorized_keys
+PermitRootLogin no
+ChallengeResponseAuthentication no
+UsePAM no
+UseDNS no
+PidFile $WORKDIR/sshd.pid
+LogLevel VERBOSE
+AllowUsers $USER
+Subsystem sftp internal-sftp
+
+Match User $USER
+    ChrootDirectory $CHROOTDIR
+    ForceCommand internal-sftp -d /shared -l VERBOSE
+    AllowTcpForwarding no
+    X11Forwarding no
+EOF
+fi
+
+# Ensure port is free (check both IPv4 and IPv6)
+echo -e "${CYAN}[*]${RESET} Checking port availability..."
+if command -v ss >/dev/null 2>&1; then
+  if ss -ltn | awk -v p=":$PORT" '$4 ~ p{exit 1}' && ss -ltn6 | awk -v p=":$PORT" '$4 ~ p{exit 1}'; then
+    echo -e "${GREEN}✓${RESET} Port $PORT is available"
+  else
+    echo -e "${RED}✗ Error: Port $PORT is already in use${RESET}" >&2
+    exit 1
+  fi
+fi
+
+echo -e "${CYAN}[*]${RESET} Starting SSH daemon..."
+"$SSHD" -f "$WORKDIR/sshd_config" -E "$WORKDIR/sshd.log"
+SSHD_PID=$(cat "$WORKDIR/sshd.pid" 2>/dev/null || echo "")
+
+sleep 0.4
+if [ -n "$SSHD_PID" ]; then
+  kill -0 "$SSHD_PID" 2>/dev/null || { 
+    echo -e "${RED}✗ sshd failed to start. See $WORKDIR/sshd.log${RESET}"
+    exit 1
+  }
+  echo -e "${GREEN}✓${RESET} SSH daemon started (PID: $SSHD_PID)"
+else
+  echo -e "${RED}✗ sshd failed to start. See $WORKDIR/sshd.log${RESET}"
+  exit 1
+fi
+
+# Detect IP address with fallbacks
+MY_IP="$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+if [ -z "$MY_IP" ]; then
+  MY_IP="$LISTEN_IP"
+fi
+if [ "$MY_IP" = "0.0.0.0" ]; then
+  MY_IP="127.0.0.1"
+fi
+
+echo ""
+cat << "EOF"
+              .__      _________                          
+  ______ _____|  |__  /   _____/ ______________  __ ____  
+ /  ___//  ___/  |  \ \_____  \_/ __ \_  __ \  \/ // __ \ 
+ \___ \ \___ \|   Y  \/        \  ___/|  | \/\   /\  ___/ 
+/____  >____  >___|  /_______  /\___  >__|    \_/  \___  >
+     \/     \/     \/        \/     \/                 \/ 
+                                                              
+EOF
+
+echo -e "${CYAN}${BOLD}╔════════════════════════════════════════════════════════════════╗${RESET}"
+echo -e "${CYAN}${BOLD}║${RESET}                  ${WHITE}${BOLD}SERVER READY - WAITING FOR CONNECTIONS${RESET}             ${CYAN}${BOLD}║${RESET}"
+echo -e "${CYAN}${BOLD}╚════════════════════════════════════════════════════════════════╝${RESET}"
+echo ""
+echo -e "${WHITE}${BOLD}📁 SHARING:${RESET}      ${GREEN}$SRCDIR${RESET}"
+echo -e "${WHITE}${BOLD}🌐 LISTENING:${RESET}    ${GREEN}$LISTEN_IP:$PORT${RESET}"
+if [ "$ALLOW_SSH" = true ]; then
+  echo -e "${WHITE}${BOLD}🔐 MODE:${RESET}         ${YELLOW}SFTP + SCP + SSH Shell${RESET} ${GRAY}(full access)${RESET}"
+else
+  echo -e "${WHITE}${BOLD}🔐 MODE:${RESET}         ${GREEN}SFTP Only${RESET} ${GRAY}(secure, file transfer only)${RESET}"
+fi
+echo ""
+if [ "$USE_KEY" = true ]; then
+  echo -e "${WHITE}${BOLD}🔑 AUTHENTICATION${RESET}"
+  echo -e "  ${CYAN}Method:${RESET}   ${BOLD}SSH Key (passwordless)${RESET}"
+  echo -e "  ${CYAN}Username:${RESET} ${BOLD}$USER${RESET}"
+  echo -e "  ${CYAN}Key file:${RESET} ${BOLD}$SESSION_KEY${RESET}"
+else
+  echo -e "${WHITE}${BOLD}📝 CREDENTIALS${RESET}"
+  echo -e "  ${CYAN}Username:${RESET} ${BOLD}$USER${RESET}"
+  echo -e "  ${CYAN}Password:${RESET} ${BOLD}$PASS${RESET}"
+fi
+echo ""
+echo -e "${WHITE}${BOLD}👤 FILE OWNERSHIP${RESET}"
+echo -e "  ${CYAN}Uploads will be owned by:${RESET} ${BOLD}$ORIGINAL_USER${RESET} ${GRAY}($ORIGINAL_UID:$ORIGINAL_GID)${RESET}"
+echo ""
+echo -e "${WHITE}${BOLD}🔌 CONNECTION EXAMPLES${RESET}"
+if [ "$USE_KEY" = true ]; then
+  if [ "$ALLOW_SSH" = true ]; then
+    echo -e "  ${GREEN}SSH:${RESET}   ${GRAY}ssh -p $PORT -i $SESSION_KEY $USER@$MY_IP${RESET}"
+  fi
+  echo -e "  ${GREEN}SFTP:${RESET}  ${GRAY}sftp -P $PORT -i $SESSION_KEY $USER@$MY_IP${RESET}"
+  echo -e "  ${GREEN}SCP:${RESET}   ${GRAY}scp -P $PORT -i $SESSION_KEY $USER@$MY_IP:/shared/file.txt .${RESET}"
+else
+  if [ "$ALLOW_SSH" = true ]; then
+    echo -e "  ${GREEN}SSH:${RESET}   ${GRAY}ssh -p $PORT $USER@$MY_IP${RESET}"
+  fi
+  echo -e "  ${GREEN}SFTP:${RESET}  ${GRAY}sftp -P $PORT $USER@$MY_IP${RESET}"
+  echo -e "  ${GREEN}SCP:${RESET}   ${GRAY}scp -P $PORT $USER@$MY_IP:/shared/file.txt .${RESET}"
+fi
+if [ "$MY_IP" != "127.0.0.1" ] && [ "$LISTEN_IP" = "0.0.0.0" ]; then
+  echo ""
+  echo -e "  ${GRAY}Local:  Use 'localhost' or '127.0.0.1' instead of $MY_IP${RESET}"
+fi
+echo ""
+echo -e "${WHITE}${BOLD}📋 LOGS & DATA${RESET}"
+echo -e "  ${CYAN}Session log:${RESET}   ${GRAY}$WORKDIR/sshd.log${RESET}"
+echo -e "  ${CYAN}Host keys:${RESET}     ${GRAY}$CHROOT_BASE/hostkeys/${RESET}"
+if [ "$USE_KEY" = true ]; then
+  echo -e "  ${CYAN}Session key:${RESET}   ${GRAY}$SESSION_KEY${RESET}"
+fi
+echo -e "  ${CYAN}Shell history:${RESET} ${GRAY}$CHROOT_BASE/history/.bash_history${RESET}"
+echo ""
+echo -e "${CYAN}${BOLD}╔════════════════════════════════════════════════════════════════╗${RESET}"
+echo -e "${CYAN}${BOLD}║${RESET}  ${YELLOW}Press Ctrl+C to stop the server and cleanup${RESET}                 ${CYAN}${BOLD}║${RESET}"
+echo -e "${CYAN}${BOLD}╚════════════════════════════════════════════════════════════════╝${RESET}"
+echo ""
+
+echo -e "${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+echo -e "${WHITE}${BOLD}ACTIVITY LOG${RESET}"
+echo -e "${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+echo ""
+
+# Function to parse and display log events
+monitor_logs() {
+  tail -f "$WORKDIR/sshd.log" 2>/dev/null | while IFS= read -r line; do
+    timestamp=$(date '+%H:%M:%S')
+    
+    # Connection received
+    if echo "$line" | grep -q "Connection from"; then
+      ip=$(echo "$line" | sed -n 's/.*Connection from \([0-9.]*\).*/\1/p')
+      echo -e "${BLUE}[${timestamp}]${RESET} ${BLUE}●${RESET} Connection from ${BOLD}${ip}${RESET}"
+    
+    # Authentication success
+    elif echo "$line" | grep -q "Accepted password for"; then
+      echo -e "${BLUE}[${timestamp}]${RESET} ${GREEN}✓${RESET} Authentication ${GREEN}successful${RESET}"
+    
+    # Authentication failure
+    elif echo "$line" | grep -q "Failed password for"; then
+      echo -e "${BLUE}[${timestamp}]${RESET} ${RED}✗${RESET} Authentication ${RED}failed${RESET}"
+    
+    # Session opened
+    elif echo "$line" | grep -q "session opened for user"; then
+      echo -e "${BLUE}[${timestamp}]${RESET} ${GREEN}✓${RESET} Session ${GREEN}opened${RESET}"
+    
+    # Session closed
+    elif echo "$line" | grep -q "session closed for user\|Received disconnect"; then
+      echo -e "${BLUE}[${timestamp}]${RESET} ${YELLOW}●${RESET} Session ${YELLOW}closed${RESET}"
+    fi
+  done
+}
+
+# Start log monitoring in background
+monitor_logs &
+MONITOR_PID=$!
+
+# Monitor the sshd process
+while kill -0 "$SSHD_PID" 2>/dev/null; do
+  sleep 1
+done
+
+echo "SSH server stopped unexpectedly. Check $WORKDIR/sshd.log"
