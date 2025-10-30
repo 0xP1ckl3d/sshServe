@@ -11,6 +11,9 @@
 
 Ephemeral SSH/SFTP server for quick file sharing or a throwaway shell. Runs a jailed `sshd` with a temporary user, chroots to a minimal environment, and bind‑mounts your current directory to `/shared`. Credentials are random by default. Nothing persists except host keys, optional session keys, and shell history.
 
+<img width="616" height="744" alt="image" src="https://github.com/user-attachments/assets/d55dfbb8-04b9-4027-8168-3205a0b443cd" />
+
+
 ## Features
 
 * SFTP‑only mode by default (no command execution)
