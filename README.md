@@ -148,8 +148,7 @@ ssh  -p 2222 <user>@<server>   # if --allow-ssh used
 * SELinux/AppArmor may restrict mounts or chroot usage
 
 ## TODO
-* Fix issue with `--use-key` which currently doesnt work due to misplaced public key file
-* make temporary keys accessible to the user who started the server
+* 
 
 ## Remove Persistent Data
 
